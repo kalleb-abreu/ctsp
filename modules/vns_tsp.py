@@ -2,12 +2,16 @@ import numpy as np
 import time
 
 class VNS_TSP:
-
-    def __init__(self, instance, alpha=0.5, t_max=None):
+    def __init__(self, instance, alpha=0.5, cycle=False, t_max=None):
         self.alpha = alpha
-        self.distance_matrix = instance.to_numpy()
+        if isinstance(instance, np.ndarray):
+            self.distance_matrix = instance
+        else:
+            self.distance_matrix = instance.to_numpy()
         self.n = self.distance_matrix.shape[0]
         
+        self.cycle = cycle
+
         if t_max is None:
             self.t_max = self.n
         else:
@@ -68,7 +72,8 @@ class VNS_TSP:
             cost += distance_matrix[v_actual][v_next]
         v_actual = solution[-1]
         v_next = solution[0]
-        cost += distance_matrix[v_actual][v_next]
+        if self.cycle:
+            cost += distance_matrix[v_actual][v_next]
         return cost
 
     def swap(self, solution, i, j):
