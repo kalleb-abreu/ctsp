@@ -1,23 +1,35 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import time
+import os
+
 from modules.vns_tsp import VNS_TSP
 
 
 class CTSP:
-    def __init__(self, instance, n_clusters, time_max=None):
+    def __init__(self, instance, n_clusters, bks_cost=None, tsp_max=None, time_max=None, gap=None):
         self.distance_matrix = instance.to_numpy()
         self.n_clusters = n_clusters
         self.clusters = self.create_clusters_array()
         self.clusters_cost = [self.objective_function(
             self.clusters[index], self.distance_matrix) for index in range(self.n_clusters)]
         if time_max is None:
-            self.max_time = self.n_clusters*self.n_clusters*self.distance_matrix.shape[0]
+            self.max_time = int(4.5 * self.distance_matrix.shape[0])
         else:
             self.max_time = time_max
+        if tsp_max is None:
+            self.tsp_max = int(self.distance_matrix.shape[0]/10)
+        else:
+            self.tsp_max = tsp_max
+        self.gap = gap
+        self.bks_cost = bks_cost
+        self.local_search_time = 0
+        self.time_history = []
+        self.best_cost_history = []
+        self.last_checkpoint = 0
 
     def create_clusters_array(self):
         clusters = [np.array([]).astype(int) for _ in range(self.n_clusters)]
-
         for i in range(self.distance_matrix.shape[0]):
             index = int(self.distance_matrix[i][0])
             clusters[index] = np.append(clusters[index], int(i))
@@ -44,7 +56,7 @@ class CTSP:
         return self.distance_matrix[cluster, :][:, cluster]
 
     def solve_tsp(self, distance_matrix):
-        vns = VNS_TSP(distance_matrix)
+        vns = VNS_TSP(distance_matrix, t_max=self.tsp_max)
         vns.fit()
         return np.array(vns.best_solution), vns.best_cost
 
@@ -84,13 +96,12 @@ class CTSP:
         self.clusters_order = self.greedy_ctsp()
         self.best_solution = self.get_ctsp_solution(self.clusters_order)
         self.best_cost = self.objective_function(
-            self.best_solution, mode="ctsp")        
+            self.best_solution, mode="ctsp")
         self.initial_cost = self.best_cost
-
-    def swap(self, solution, i, j):
-        new_solution = solution[:]
-        new_solution[i], new_solution[j] = new_solution[j], new_solution[i]
-        return new_solution
+        
+        # Record initial best cost
+        self.time_history.append(0)
+        self.best_cost_history.append(self.best_cost)
 
     def two_opt(self, solution, i, j):
         new_solution = np.concatenate((
@@ -110,40 +121,85 @@ class CTSP:
                     new_solution = self.get_ctsp_solution(new_clusters_order)
                     new_cost = self.objective_function(
                         new_solution, mode='ctsp')
-                    if new_cost < cost:
+                    if new_cost < self.best_cost:
                         return new_clusters_order, new_solution, new_cost
         return clusters_order, solution, cost
 
-    def shuffle_inner_clusters(self):
-        n_shuffles = np.random.randint(1, self.n_clusters)
-        for _ in range(n_shuffles):
-            for i in range(self.n_clusters):
+    def get_shuffle_probability(self, local_search_time, exponent=2, start_prob=0.2):
+        if self.max_time <= 0:
+            return start_prob
+        ratio = local_search_time / self.max_time
+        return min(1.0, start_prob + (1 - start_prob) * (1 - np.exp(-exponent * ratio)))
+    
+    def shuffle_inner_clusters(self, probability=0.5):
+        for i in range(self.n_clusters):
+            if np.random.random() < probability:
                 self.clusters[i] = np.random.permutation(self.clusters[i])
+    
+    def get_mask_combinations(self, n_max=20):
+        n = min(self.n_clusters, n_max) if n_max is not None else self.n_clusters
+        combinations = []
+        for x in range(2**n):
+            mask = [int(b) for b in f'{x:0{n}b}']
+            if len(mask) < self.n_clusters:
+                mask.extend([0] * (self.n_clusters - len(mask)))
+            combinations.append(mask)
+        return np.array(combinations)
+    
+    def reverse_clusters_by_mask(self, mask):
+        """Reverse clusters according to mask values (1=reverse, 0=keep)"""
+        for i, should_reverse in enumerate(mask):
+            if should_reverse:
+                self.clusters[i] = self.clusters[i][::-1]
 
     def local_search(self):
-        max_not_improving = pow(self.distance_matrix.shape[0], 10)
-        clusters_order = self.clusters_order
+        ls_start_time = time.time()
         self.not_improving = 0
 
-        while True:
-            while True: # se não melhorar, sai
-                clusters_order, solution, cost = self.first_improvement(
-                    clusters_order, self.two_opt)
-                if cost < self.best_cost:
-                    self.clusters_order = clusters_order
-                    self.best_solution = solution
-                    self.best_cost = cost
-                else:
-                    self.not_improving += 1
-                    break
-            condA = self.not_improving >= max_not_improving
-            condB = time.time() - self.start_time - self.build_time > self.max_time
+        clusters_order = self.clusters_order.copy()
+        masks = self.get_mask_combinations()            
+        while True:     
+            for i in range(len(masks)):
+                self.reverse_clusters_by_mask(masks[i])
+                cost = self.objective_function(self.get_ctsp_solution(clusters_order), mode='ctsp')
+                while True: # se não melhorar, sai
+                    current_time = time.time() - ls_start_time
+                    if current_time - self.last_checkpoint >= 1:
+                        self.time_history.append(current_time)
+                        self.best_cost_history.append(self.best_cost)
+                        self.last_checkpoint = current_time
+                        # print(f"Time: {current_time:.2f}s, Cost: {self.best_cost:.4f}")
+                    clusters_order, solution, cost = self.first_improvement(
+                        clusters_order, self.two_opt)
+                    if cost < self.best_cost:
+                        self.clusters_order = clusters_order
+                        self.best_solution = solution
+                        self.best_cost = cost
+                        i = 0
+                    else:
+                        self.not_improving += 1
+                        self.reverse_clusters_by_mask(masks[i])
+                        break
+                                            # Record time and cost every 10 seconds
+ 
+            local_search_time = time.time() - ls_start_time
+            condA = self.gap is not None and self.bks_cost is not None and cost <= self.bks_cost * (1 + self.gap)
+            condB = self.max_time is not None and local_search_time + self.build_time > self.max_time
             
             if condA or condB:
                 self.end_time = time.time()
+                self.local_search_time = self.end_time - ls_start_time
+                
+                # Record final time and cost
+                if self.time_history[-1] != local_search_time:
+                    self.time_history.append(local_search_time)
+                    self.best_cost_history.append(self.best_cost)
                 break
             
-            self.shuffle_inner_clusters()
+            shuffle_prob = self.get_shuffle_probability(local_search_time)
+            self.shuffle_inner_clusters(shuffle_prob)
+            # print(f"Shuffle probability: {shuffle_prob}")
+            # print(f"Best cost: {self.best_cost}")
 
     def fit(self):
         self.start_time = time.time()
@@ -152,137 +208,71 @@ class CTSP:
 
         self.local_search()
         self.total_time = self.end_time - self.start_time
-        self.ls_time = self.total_time - self.build_time
 
     def print_results(self, instance, line_length=50):
         instance_display = f" {instance} "
         dashes = (line_length - len(instance_display)) // 2
-        print(f"{'='*dashes}{instance_display}{'=' *
-              (line_length-dashes-len(instance_display))}")
-        print(f"Initial cost:{self.initial_cost:>{
-              line_length-len('Initial cost:')},.4f}")
-        print(f"Best cost found:{self.best_cost:>{
-              line_length-len('Best cost found:')},.4f}")
+        print(f"{'='*dashes}{instance_display}{'=' * (line_length-dashes-len(instance_display))}")
+        if self.bks_cost is not None:
+            print(f"BKS cost:{self.bks_cost:>{line_length-len('BKS cost:')},.4f}")
+        print(f"Initial cost:{self.initial_cost:>{line_length-len('Initial cost:')},.4f}")
+        print(f"Best cost found:{self.best_cost:>{line_length-len('Best cost found:')},.4f}")
         improvement = ((self.initial_cost - self.best_cost) / self.initial_cost) * 100
-        print(f"Improvement (%):{improvement:>{
-              line_length-len('Improvement (%):')},.2f}")
-        print(f"Build time (s):{self.build_time:>{
-              line_length-len('Build time (s):')},.2f}")
-        print(f"Total execution time (s):{self.total_time:>{
-              line_length-len('Total execution time (s):')},.2f}")
-        print(f"Iterations without improvement:{self.not_improving:>{
-              line_length-len('Iterations without improvement:')},}")
+        print(f"Improvement from initial (%):{improvement:>{line_length-len('Improvement from initial (%):')},.2f}")
+        if self.bks_cost is not None:
+            gap = ((self.best_cost - self.bks_cost) / self.bks_cost) * 100
+            print(f"Gap to BKS (%):{gap:>{line_length-len('Gap to BKS (%):')},.2f}")
+        print(f"Build time (s):{self.build_time:>{line_length-len('Build time (s):')},.2f}")
+        print(f"Local search time (s):{self.local_search_time:>{line_length-len('Local search time (s):')},.2f}")
+        print(f"Total execution time (s):{self.total_time:>{line_length-len('Total execution time (s):')},.2f}")
+        print(f"Iterations without improvement:{self.not_improving:>{line_length-len('Iterations without improvement:')},}")
         print("-" * line_length, end="\n\n")
 
-
-    def plot_solution(self, df, output_path):
-        """
-        Saves visualization of the clustered solution as a directed graph using node coordinates.
-        Shows cluster regions and path between nodes based on cluster order.
-        
-        Parameters
-        ----------
-        df : pandas.DataFrame
-            DataFrame containing X,Y coordinates for each node
-        output_path : str
-            Path where the plot image should be saved
-        """
+    def plot_shuffle_probability(self, exponents=[2, 3, 4, 5]):
+        times = np.linspace(0, self.max_time, 100)
         import matplotlib.pyplot as plt
-        import networkx as nx
-        from matplotlib.patches import Polygon
-        from scipy.spatial import ConvexHull
-        import numpy as np
-
-        # Create directed graph
-        G = nx.DiGraph()
+        plt.figure(figsize=(10,6))
+        for exp in exponents:
+            probs = [self.get_shuffle_probability(t, exponent=exp) for t in times]
+            plt.plot(times, probs, label=f'exponent={exp}')
         
-        # Build solution following cluster order
-        solution = []
-        for i in range(len(self.clusters_order)):
-            cluster_nodes = self.clusters[self.clusters_order[i]]
-            solution.extend([int(node) for node in cluster_nodes])
-            
-            # Add edges between nodes within cluster
-            for j in range(len(cluster_nodes)-1):
-                G.add_edge(int(cluster_nodes[j]), int(cluster_nodes[j+1]))
-            
-            # If not last cluster, add edge to first node of next cluster
-            if i < len(self.clusters_order)-1:
-                next_cluster = self.clusters[self.clusters_order[i+1]]
-                G.add_edge(int(cluster_nodes[-1]), int(next_cluster[0]))
-        
-        # Add edge from last node of last cluster to first node of first cluster
-        first_cluster_first_node = int(self.clusters[self.clusters_order[0]][0])
-        last_cluster_last_node = int(self.clusters[self.clusters_order[-1]][-1])
-        G.add_edge(last_cluster_last_node, first_cluster_first_node)
-
-        plt.figure(figsize=(12, 12))
-        
-        # Create position dictionary using X,Y coordinates
-        pos = {node: (df.loc[node, 'X'], df.loc[node, 'Y']) 
-               for node in G.nodes()}
-        
-        # Plot cluster regions in order
-        colors = plt.cm.Set3(np.linspace(0, 1, len(self.clusters)))
-        
-        # Create sorted cluster labels
-        for i in range(len(self.clusters_order)):
-            label = f'Cluster {self.clusters_order[i]}'
-            cluster = self.clusters[self.clusters_order[i]]
-            if len(cluster) > 2:  # Need at least 3 points for ConvexHull
-                cluster_points = np.array([(df.loc[int(node), 'X'], df.loc[int(node), 'Y']) 
-                                         for node in cluster])
-                hull = ConvexHull(cluster_points)
-                hull_points = cluster_points[hull.vertices]
-                
-                # Create polygon with some transparency
-                polygon = Polygon(hull_points, 
-                                facecolor=colors[i],
-                                alpha=0.2,
-                                edgecolor=colors[i],
-                                linewidth=2,
-                                label=label)
-                plt.gca().add_patch(polygon)
-        
-        # Draw nodes
-        node_colors = ['red' if node == first_cluster_first_node else 'lightblue' 
-                      for node in G.nodes()]
-        nx.draw_networkx_nodes(G, pos, 
-                             node_color=node_colors,
-                             node_size=500)
-        
-        # Draw edges with arrows
-        nx.draw_networkx_edges(G, pos,
-                             edge_color='gray',
-                             width=2,
-                             arrowsize=20,
-                             arrowstyle='->',
-                             connectionstyle='arc3,rad=0.2')
-        
-        # Add node labels
-        node_labels = {node: f'{node}*' if node == first_cluster_first_node else str(node) 
-                      for node in G.nodes()}
-        nx.draw_networkx_labels(G, pos, labels=node_labels)
-        
-        plt.title('Clustered Solution Path')
-        plt.axis('equal')
-        
-        # Sort legend labels alphabetically
-        handles, labels = plt.gca().get_legend_handles_labels()
-        labels, handles = zip(*sorted(zip(labels, handles), key=lambda t: int(t[0].split()[1])))
-        plt.legend(handles, labels, title='Cluster Order')
-        
-        plt.savefig(output_path, bbox_inches='tight', dpi=300)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Shuffle Probability')
+        plt.title('Shuffle Probability vs Time')
+        plt.grid(True)
+        plt.legend()
+        plt.savefig('shuffle_prob.png')
         plt.close()
 
-
-
-
-
-
-
-
-
-
-
-
+    def plot_cost_over_time(self, instance, output_path):
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+        
+        # Plot cost in upper subplot
+        ax1.plot(self.time_history, self.best_cost_history, 'b-')
+        ax1.set_ylabel('Best Cost Found')
+        ax1.set_xlabel('Time (s)')
+        ax1.grid(True)
+        ax1.set_title(f'Cost Evolution Over Time - {instance}')
+        
+        # Plot gap in lower subplot if BKS exists
+        if self.bks_cost is not None:
+            gaps = [(cost - self.bks_cost) / self.bks_cost * 100 
+                   for cost in self.best_cost_history]
+            ax2.plot(self.time_history, gaps, 'r-')
+            ax2.set_ylabel('Gap to BKS (%)')
+        else:
+            ax2.text(0.5, 0.5, 'No BKS available', 
+                    horizontalalignment='center',
+                    verticalalignment='center',
+                    transform=ax2.transAxes)
+            
+        ax2.grid(True)
+        ax2.set_xlabel('Time (s)')
+        
+        # Adjust layout to prevent overlap
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_path, f'cost_over_time_{instance}.png'))
+        plt.close()
+        
