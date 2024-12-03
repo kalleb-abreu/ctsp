@@ -142,7 +142,6 @@ def save_instance_results(results_file, instance_name, ctsp):
         "best_SOL": [ctsp.best_solution],
         "build_time": [ctsp.build_time],
         "total_time": [ctsp.total_time],
-        "iterations_without_improvement": [ctsp.not_improving]
     })
 
     if os.path.exists(results_file):

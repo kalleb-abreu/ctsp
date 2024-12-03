@@ -5,14 +5,32 @@ import os
 
 from modules.vns_tsp import VNS_TSP
 
+# TODO:
+# - Refactor to use classes for each component (SolutionBuilder, LocalSearch, Results, Configuration)
+# - Move utility functions to separate module (utils.py)
+# - Consider using a Configuration class to handle all parameters   
 
 class CTSP:
     def __init__(self, instance, n_clusters, bks_cost=None, tsp_max=None, time_max=None, gap=None):
+        
+        # Distance Matrix
         self.distance_matrix = instance.to_numpy()
+        
+        # Number of Clusters
         self.n_clusters = n_clusters
+        
+        # Clusters
         self.clusters = self.create_clusters_array()
+        
+        # Order of Clusters
+        self.clusters_order = np.arange(self.n_clusters)
+
         self.clusters_cost = [self.objective_function(
             self.clusters[index], self.distance_matrix) for index in range(self.n_clusters)]
+        
+        self.best_cost = np.inf
+        self.best_solution = None
+                
         if time_max is None:
             self.max_time = int(4.5 * self.distance_matrix.shape[0])
         else:
@@ -60,20 +78,22 @@ class CTSP:
         vns.fit()
         return np.array(vns.best_solution), vns.best_cost
 
-    def greedy_ctsp(self):
+    def greedy_ctsp(self, first=None):
         pool = np.arange(self.n_clusters)
-        clusters_order = np.array([np.random.choice(pool)])
-
-        pool = np.delete(pool, clusters_order[-1])
+        if first is None:
+            first = np.random.choice(pool)
+        pool = np.delete(pool, first)
+        clusters_order = np.array([first])
+        
         while len(pool) > 0:
             min_cost = np.inf
-            # check the cost in the distance matrix using the last value in the cluster_order
             for i in range(len(pool)):
-                cost = self.distance_matrix[clusters_order[-1], pool[i]]
+                last_node = self.clusters[clusters_order[-1]][-1]
+                next_node = self.clusters[pool[i]][0]
+                cost = self.distance_matrix[last_node, next_node]
                 if cost < min_cost:
                     min_cost = cost
                     min_cost_index = i
-            # if the value is the minimum, add it to the cluster_order and remove it from the pool
             clusters_order = np.append(clusters_order, pool[min_cost_index])
             pool = np.delete(pool, min_cost_index)
 
@@ -85,23 +105,49 @@ class CTSP:
             for node in self.clusters[cluster]:
                 solution.append(int(node))
         return solution
+    
+    def fixed_starting_node(self, order):
+        zero_index = np.where(order == 0)[0][0]
+        if zero_index == 0:
+            return order
+        return np.concatenate((order[zero_index:], order[:zero_index]))
 
-    def build_initial_solution(self):
+    def check_cyclic_solution(self, orders):
+        fixed_orders = []
+        for order in orders:
+            fixed_orders.append(self.fixed_starting_node(order))        
+        index = []
+        for i in range(len(fixed_orders)-1, -1, -1):
+            for j in range(i):
+                flag = True
+                for k in range(self.n_clusters):
+                    if fixed_orders[i][k] != fixed_orders[j][k]:
+                        flag = False
+                        break
+                if flag:
+                    if i not in index:
+                        index.append(i)
+        for i in index:
+            orders.pop(i)
+        return orders
+
+    def build_solution(self):
         for i in range(self.n_clusters):
             best_solution, best_cost = self.solve_tsp(
                 self.get_short_distance_matrix(i))
             self.clusters[i] = self.clusters[i][best_solution]
             self.clusters_cost[i] = float(best_cost)
 
-        self.clusters_order = self.greedy_ctsp()
-        self.best_solution = self.get_ctsp_solution(self.clusters_order)
-        self.best_cost = self.objective_function(
-            self.best_solution, mode="ctsp")
-        self.initial_cost = self.best_cost
+        clusters_orders = []
+        for i in range(self.n_clusters):
+            clusters_orders.append(self.greedy_ctsp(first=i))
         
-        # Record initial best cost
+        self.check_cyclic_solution(clusters_orders)
+        
         self.time_history.append(0)
         self.best_cost_history.append(self.best_cost)
+
+        return self.clusters.copy(), self.clusters_cost.copy(), clusters_orders
 
     def two_opt(self, solution, i, j):
         new_solution = np.concatenate((
@@ -124,17 +170,6 @@ class CTSP:
                     if new_cost < self.best_cost:
                         return new_clusters_order, new_solution, new_cost
         return clusters_order, solution, cost
-
-    def get_shuffle_probability(self, local_search_time, exponent=2, start_prob=0.2):
-        if self.max_time <= 0:
-            return start_prob
-        ratio = local_search_time / self.max_time
-        return min(1.0, start_prob + (1 - start_prob) * (1 - np.exp(-exponent * ratio)))
-    
-    def shuffle_inner_clusters(self, probability=0.5):
-        for i in range(self.n_clusters):
-            if np.random.random() < probability:
-                self.clusters[i] = np.random.permutation(self.clusters[i])
     
     def get_mask_combinations(self, n_max=20):
         n = min(self.n_clusters, n_max) if n_max is not None else self.n_clusters
@@ -153,9 +188,6 @@ class CTSP:
                 self.clusters[i] = self.clusters[i][::-1]
 
     def local_search(self):
-        ls_start_time = time.time()
-        self.not_improving = 0
-
         clusters_order = self.clusters_order.copy()
         masks = self.get_mask_combinations()            
         while True:     
@@ -163,7 +195,7 @@ class CTSP:
                 self.reverse_clusters_by_mask(masks[i])
                 cost = self.objective_function(self.get_ctsp_solution(clusters_order), mode='ctsp')
                 while True: # se não melhorar, sai
-                    current_time = time.time() - ls_start_time
+                    current_time = time.time() - self.ls_start_time
                     if current_time - self.last_checkpoint >= 1:
                         self.time_history.append(current_time)
                         self.best_cost_history.append(self.best_cost)
@@ -177,39 +209,47 @@ class CTSP:
                         self.best_cost = cost
                         i = 0
                     else:
-                        self.not_improving += 1
                         self.reverse_clusters_by_mask(masks[i])
                         break
                                             # Record time and cost every 10 seconds
  
-            local_search_time = time.time() - ls_start_time
-            condA = self.gap is not None and self.bks_cost is not None and cost <= self.bks_cost * (1 + self.gap)
-            condB = self.max_time is not None and local_search_time + self.build_time > self.max_time
+            local_search_time = time.time() - self.ls_start_time
+            # condA = self.gap is not None and self.bks_cost is not None and cost <= self.bks_cost * (1 + self.gap)
+            # condB = self.max_time is not None and local_search_time + self.build_time > self.max_time
             
-            if condA or condB:
-                self.end_time = time.time()
-                self.local_search_time = self.end_time - ls_start_time
-                
-                # Record final time and cost
-                if self.time_history[-1] != local_search_time:
-                    self.time_history.append(local_search_time)
-                    self.best_cost_history.append(self.best_cost)
-                break
+            # if condA or condB:
+            self.end_time = time.time()
+            self.local_search_time = self.end_time - self.ls_start_time
             
-            shuffle_prob = self.get_shuffle_probability(local_search_time)
-            self.shuffle_inner_clusters(shuffle_prob)
-            # print(f"Shuffle probability: {shuffle_prob}")
-            # print(f"Best cost: {self.best_cost}")
+            # Record final time and cost
+            if self.time_history[-1] != local_search_time:
+                self.time_history.append(local_search_time)
+                self.best_cost_history.append(self.best_cost)
+            break
 
     def fit(self):
+
         self.start_time = time.time()
-        self.build_initial_solution()
+        clusters, clusters_cost, clusters_orders = self.build_solution()
         self.build_time = time.time() - self.start_time
 
-        self.local_search()
+        self.ls_start_time = time.time()
+        for i in range(len(clusters_orders)):
+            self.clusters_order = clusters_orders[i]
+            self.clusters = clusters.copy()
+            self.clusters_cost = clusters_cost.copy()
+
+            cost = self.objective_function(self.get_ctsp_solution(self.clusters_order), mode="ctsp")
+            if cost < self.best_cost:
+                self.best_solution = self.get_ctsp_solution(self.clusters_order)
+                self.best_cost = cost
+            if i == 0:
+                self.initial_cost = self.best_cost
+
+            self.local_search()
         self.total_time = self.end_time - self.start_time
 
-    def print_results(self, instance, line_length=50):
+    def print_results(self, instance, my_best_gap=None, line_length=50):
         instance_display = f" {instance} "
         dashes = (line_length - len(instance_display)) // 2
         print(f"{'='*dashes}{instance_display}{'=' * (line_length-dashes-len(instance_display))}")
@@ -221,11 +261,12 @@ class CTSP:
         print(f"Improvement from initial (%):{improvement:>{line_length-len('Improvement from initial (%):')},.2f}")
         if self.bks_cost is not None:
             gap = ((self.best_cost - self.bks_cost) / self.bks_cost) * 100
+            gap_improvement = my_best_gap - gap
             print(f"Gap to BKS (%):{gap:>{line_length-len('Gap to BKS (%):')},.2f}")
+            print(f"Gap improvement (%):{gap_improvement:>{line_length-len('Gap improvement (%):')},.2f}")
         print(f"Build time (s):{self.build_time:>{line_length-len('Build time (s):')},.2f}")
         print(f"Local search time (s):{self.local_search_time:>{line_length-len('Local search time (s):')},.2f}")
         print(f"Total execution time (s):{self.total_time:>{line_length-len('Total execution time (s):')},.2f}")
-        print(f"Iterations without improvement:{self.not_improving:>{line_length-len('Iterations without improvement:')},}")
         print("-" * line_length, end="\n\n")
 
     def plot_shuffle_probability(self, exponents=[2, 3, 4, 5]):
@@ -275,4 +316,3 @@ class CTSP:
         plt.tight_layout()
         plt.savefig(os.path.join(output_path, f'cost_over_time_{instance}.png'))
         plt.close()
-        
